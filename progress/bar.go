@@ -26,9 +26,15 @@ type Bar struct {
 	currentValue int64
 
 	started time.Time
+	stopped time.Time
 
-	stats   Stats
-	statted time.Time
+	maxBuckets int
+	buckets    []bucket
+}
+
+type bucket struct {
+	updated time.Time
+	value   int64
 }
 
 func NewBar(message string, maxValue, initialValue int64) *Bar {
@@ -39,6 +45,7 @@ func NewBar(message string, maxValue, initialValue int64) *Bar {
 		initialValue: initialValue,
 		currentValue: initialValue,
 		started:      time.Now(),
+		maxBuckets:   10,
 	}
 }
 
@@ -50,43 +57,52 @@ func (b *Bar) String() string {
 
 	var pre, mid, suf strings.Builder
 
-	if b.message != "" {
+	if len(b.message) > 0 {
 		message := strings.TrimSpace(b.message)
 		if b.messageWidth > 0 && len(message) > b.messageWidth {
 			message = message[:b.messageWidth]
 		}
 
 		fmt.Fprintf(&pre, "%s", message)
-		if b.messageWidth-pre.Len() >= 0 {
-			pre.WriteString(strings.Repeat(" ", b.messageWidth-pre.Len()))
+		if padding := b.messageWidth - pre.Len(); padding > 0 {
+			pre.WriteString(strings.Repeat(" ", padding))
 		}
 
 		pre.WriteString(" ")
 	}
 
 	fmt.Fprintf(&pre, "%3.0f%% ", math.Floor(b.percent()))
-	fmt.Fprintf(&suf, "(%s/%s", format.HumanBytes(b.currentValue), format.HumanBytes(b.maxValue))
 
-	stats := b.Stats()
-	rate := int64(stats.rate)
-	if rate > 0 {
-		fmt.Fprintf(&suf, ", %s/s", format.HumanBytes(rate))
+	suf.WriteRune('(')
+
+	progress := format.HumanBytes(b.maxValue)
+	if b.stopped.IsZero() {
+		progress = fmt.Sprintf("%s/%s", format.HumanBytes(b.currentValue), format.HumanBytes(b.maxValue))
 	}
 
-	fmt.Fprintf(&suf, ")")
+	fmt.Fprintf(&suf, "%s", progress)
 
-	elapsed := time.Since(b.started)
-	if b.percent() < 100 && rate > 0 {
-		fmt.Fprintf(&suf, " [%s:%s]", elapsed.Round(time.Second), stats.remaining)
-	} else {
-		fmt.Fprintf(&suf, "        ")
+	rate := b.rate()
+	if b.stopped.IsZero() {
+		fmt.Fprintf(&suf, ", %s/s", format.HumanBytes(int64(rate)))
 	}
 
-	mid.WriteString("▕")
+	suf.WriteRune(')')
+
+	if b.stopped.IsZero() {
+		var remaining time.Duration
+		if rate > 0 {
+			remaining = time.Duration(int64(float64(b.maxValue-b.currentValue)/rate)) * time.Second
+		}
+
+		fmt.Fprintf(&suf, " [%s:%s]", b.elapsed(), remaining)
+	}
 
 	// add 3 extra spaces: 2 boundary characters and 1 space at the end
 	f := termWidth - pre.Len() - suf.Len() - 3
 	n := int(float64(f) * b.percent() / 100)
+
+	mid.WriteString("▕")
 
 	if n > 0 {
 		mid.WriteString(strings.Repeat("█", n))
@@ -107,6 +123,21 @@ func (b *Bar) Set(value int64) {
 	}
 
 	b.currentValue = value
+	if b.currentValue >= b.maxValue {
+		b.stopped = time.Now()
+	}
+
+	// throttle bucket updates to 1 per second
+	if len(b.buckets) == 0 || time.Since(b.buckets[len(b.buckets)-1].updated) > time.Second {
+		b.buckets = append(b.buckets, bucket{
+			updated: time.Now(),
+			value:   value,
+		})
+
+		if len(b.buckets) > b.maxBuckets {
+			b.buckets = b.buckets[1:]
+		}
+	}
 }
 
 func (b *Bar) percent() float64 {
@@ -117,39 +148,27 @@ func (b *Bar) percent() float64 {
 	return 0
 }
 
-func (b *Bar) Stats() Stats {
-	if time.Since(b.statted) < time.Second {
-		return b.stats
+func (b *Bar) rate() float64 {
+	if !b.stopped.IsZero() {
+		return (float64(b.currentValue) - float64(b.initialValue)) / b.elapsed().Seconds()
 	}
 
-	switch {
-	case b.statted.IsZero():
-		b.stats = Stats{
-			value:     b.initialValue,
-			rate:      0,
-			remaining: 0,
-		}
-	case b.currentValue >= b.maxValue:
-		b.stats = Stats{
-			value:     b.maxValue,
-			rate:      0,
-			remaining: 0,
-		}
+	switch len(b.buckets) {
+	case 0:
+		return 0
+	case 1:
+		return float64(b.buckets[0].value-b.initialValue) / b.buckets[0].updated.Sub(b.started).Seconds()
 	default:
-		rate := b.currentValue - b.stats.value
-		var remaining time.Duration
-		if rate > 0 {
-			remaining = time.Second * time.Duration((float64(b.maxValue-b.currentValue))/(float64(rate)))
-		}
+		first, last := b.buckets[0], b.buckets[len(b.buckets)-1]
+		return (float64(last.value) - float64(first.value)) / last.updated.Sub(first.updated).Seconds()
+	}
+}
 
-		b.stats = Stats{
-			value:     b.currentValue,
-			rate:      rate,
-			remaining: remaining,
-		}
+func (b *Bar) elapsed() time.Duration {
+	elapsed := time.Since(b.started)
+	if !b.stopped.IsZero() {
+		elapsed = b.stopped.Sub(b.started)
 	}
 
-	b.statted = time.Now()
-
-	return b.stats
+	return elapsed.Round(time.Second)
 }
